@@ -84,8 +84,42 @@ pub fn transform_extraction_result_to_elements(result: &ExtractionResult) -> Vec
             }
         }
     } else {
-        // Fallback: No pages, process unified content with page 1
-        process_content(&mut elements, &result.content, 1, &result.metadata.title);
+        // When ocr_elements are available, generate Elements from them to preserve
+        // bounding geometry for downstream IoU-based deduplication across OCR passes.
+        // Fall back to process_content for plain-text documents without OCR output.
+        if let Some(ref ocr_elements) = result.ocr_elements {
+            let title = &result.metadata.title;
+            for ocr_el in ocr_elements {
+                if ocr_el.text.trim().is_empty() {
+                    continue;
+                }
+                let (left, top, width, height) = ocr_el.geometry.to_aabb();
+                let coordinates = Some(crate::types::BoundingBox {
+                    x0: f64::from(left),
+                    y0: f64::from(top),
+                    x1: f64::from(left.saturating_add(width)),
+                    y1: f64::from(top.saturating_add(height)),
+                });
+                let page_number = Some(ocr_el.page_number);
+                let element_type = crate::types::ElementType::NarrativeText;
+                let element_id = elements::generate_element_id(&ocr_el.text, element_type, page_number);
+                elements.push(crate::types::Element {
+                    element_id,
+                    element_type,
+                    text: ocr_el.text.clone(),
+                    metadata: crate::types::ElementMetadata {
+                        page_number,
+                        filename: title.clone(),
+                        coordinates,
+                        element_index: Some(elements.len()),
+                        additional: std::collections::HashMap::new(),
+                    },
+                });
+            }
+        } else {
+            // Fallback: No pages and no OCR elements — process unified content with page 1
+            process_content(&mut elements, &result.content, 1, &result.metadata.title);
+        }
 
         // Process global tables (if any)
         for table in &result.tables {
