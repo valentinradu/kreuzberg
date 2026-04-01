@@ -1,0 +1,1085 @@
+//! Markdown extractor with YAML frontmatter support.
+//!
+//! This extractor provides:
+//! - Comprehensive markdown parsing using pulldown-cmark
+//! - Complete YAML frontmatter metadata extraction:
+//!   - Standard fields: title, author, date, description, keywords
+//!   - Extended fields: abstract, subject, category, tags, language, version
+//! - Automatic conversion of array fields (keywords, tags) to comma-separated strings
+//! - Table extraction as structured data
+//! - Heading structure preservation
+//! - Code block and link extraction
+//! - Data URI image extraction
+//!
+use super::frontmatter_utils::{
+    cells_to_markdown, extract_frontmatter, extract_metadata_from_yaml, extract_title_from_content,
+};
+use crate::Result;
+use crate::core::config::ExtractionConfig;
+use crate::plugins::{DocumentExtractor, Plugin};
+use crate::types::builder::DocumentStructureBuilder;
+use crate::types::document_structure::DocumentStructure;
+use crate::types::{ExtractionResult, Metadata, Table};
+use async_trait::async_trait;
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use std::borrow::Cow;
+
+/// Annotation tracking entry: (kind_tag, byte_start, optional link data).
+///
+/// kind_tag: 0=bold, 1=italic, 2=strikethrough, 3=code, 4=link
+type AnnotationEntry = (u8, u32, Option<(String, Option<String>)>);
+
+/// Markdown extractor with metadata and table support.
+///
+/// Parses markdown documents with YAML frontmatter, extracting:
+/// - Metadata from YAML frontmatter
+/// - Plain text content
+/// - Tables as structured data
+/// - Document structure (headings, links, code blocks)
+/// - Images from data URIs
+pub struct MarkdownExtractor;
+
+impl MarkdownExtractor {
+    /// Create a new Markdown extractor.
+    pub fn new() -> Self {
+        Self
+    }
+
+    // Frontmatter utilities moved to shared frontmatter_utils module
+    // Text extraction and data URI decoding moved to shared markdown_utils module
+
+    /// Extract tables from markdown AST.
+    fn extract_tables_from_events(events: &[Event]) -> Vec<Table> {
+        let mut tables = Vec::new();
+        let mut current_table: Option<(Vec<Vec<String>>, usize)> = None;
+        let mut current_row: Vec<String> = Vec::new();
+        let mut current_cell = String::new();
+        let mut in_table_cell = false;
+        let mut table_index = 0;
+
+        for event in events {
+            match event {
+                Event::Start(Tag::Table(_)) => {
+                    current_table = Some((Vec::new(), table_index));
+                }
+                Event::Start(Tag::TableHead) => {}
+                Event::Start(Tag::TableRow) => {
+                    current_row = Vec::new();
+                }
+                Event::Start(Tag::TableCell) => {
+                    current_cell = String::new();
+                    in_table_cell = true;
+                }
+                Event::Text(s) if in_table_cell => {
+                    current_cell.push_str(s);
+                }
+                Event::Code(s) if in_table_cell => {
+                    current_cell.push_str(s);
+                }
+                Event::End(TagEnd::TableCell) if in_table_cell => {
+                    current_row.push(current_cell.trim().to_string());
+                    current_cell = String::new();
+                    in_table_cell = false;
+                }
+                Event::End(TagEnd::TableHead) => {
+                    if !current_row.is_empty()
+                        && let Some((ref mut rows, _)) = current_table
+                    {
+                        rows.push(std::mem::take(&mut current_row));
+                    }
+                    current_row = Vec::new();
+                }
+                Event::End(TagEnd::TableRow) => {
+                    if !current_row.is_empty()
+                        && let Some((ref mut rows, _)) = current_table
+                    {
+                        rows.push(std::mem::take(&mut current_row));
+                    }
+                    current_row = Vec::new();
+                }
+                Event::End(TagEnd::Table) => {
+                    if let Some((cells, idx)) = current_table.take()
+                        && !cells.is_empty()
+                    {
+                        let markdown = cells_to_markdown(&cells);
+                        tables.push(Table {
+                            cells,
+                            markdown,
+                            page_number: idx + 1,
+                            bounding_box: None,
+                        });
+                        table_index += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        tables
+    }
+
+    // cells_to_markdown and extract_title_from_content moved to shared frontmatter_utils module
+
+    /// Build a `DocumentStructure` from pulldown-cmark events and optional YAML frontmatter.
+    fn build_document_structure(events: &[Event], yaml: &Option<serde_yaml_ng::Value>) -> DocumentStructure {
+        let mut builder = DocumentStructureBuilder::new().source_format("markdown");
+
+        // Emit frontmatter as a metadata block
+        if let Some(serde_yaml_ng::Value::Mapping(map)) = yaml {
+            let entries: Vec<(String, String)> = map
+                .iter()
+                .filter_map(|(k, v)| {
+                    let key = k.as_str()?.to_string();
+                    let val = match v {
+                        serde_yaml_ng::Value::String(s) => s.clone(),
+                        other => format!("{other:?}"),
+                    };
+                    Some((key, val))
+                })
+                .collect();
+            if !entries.is_empty() {
+                builder.push_metadata_block(entries, None);
+            }
+        }
+
+        Self::walk_events_into_builder(events, &mut builder);
+        builder.build()
+    }
+
+    /// Walk pulldown-cmark events and push nodes into the builder.
+    fn walk_events_into_builder(events: &[Event], builder: &mut DocumentStructureBuilder) {
+        use crate::types::builder;
+        use crate::types::document_structure::TextAnnotation;
+
+        let mut paragraph_text = String::new();
+        let mut paragraph_annotations: Vec<TextAnnotation> = Vec::new();
+        let mut in_paragraph = false;
+        let mut heading_text = String::new();
+        let mut heading_level: u8 = 0;
+        let mut in_heading = false;
+        let mut code_text = String::new();
+        let mut code_lang: Option<String> = None;
+        let mut in_code_block = false;
+        let mut blockquote_depth: u32 = 0;
+        let mut table_rows: Vec<Vec<String>> = Vec::new();
+        let mut current_row: Vec<String> = Vec::new();
+        let mut current_cell = String::new();
+        let mut in_table_cell = false;
+        let mut list_stack: Vec<(crate::types::document_structure::NodeIndex, bool)> = Vec::new();
+        let mut list_item_text = String::new();
+        let mut in_list_item = false;
+        let mut in_image = false;
+        let mut image_alt = String::new();
+
+        // Annotation tracking: stack of (annotation_kind_tag, byte_start) for the
+        // active text buffer (paragraph_text when in_paragraph).
+        // kind_tag: 0=bold, 1=italic, 2=strikethrough, 3=code, 4=link
+        let mut annotation_starts: Vec<AnnotationEntry> = Vec::new();
+
+        /// Get the current length of the active text buffer as u32.
+        fn text_offset(paragraph_text: &str, in_paragraph: bool) -> u32 {
+            if in_paragraph { paragraph_text.len() as u32 } else { 0 }
+        }
+
+        for event in events {
+            match event {
+                Event::Start(Tag::Heading { level, .. }) => {
+                    heading_text.clear();
+                    heading_level = match *level {
+                        pulldown_cmark::HeadingLevel::H1 => 1,
+                        pulldown_cmark::HeadingLevel::H2 => 2,
+                        pulldown_cmark::HeadingLevel::H3 => 3,
+                        pulldown_cmark::HeadingLevel::H4 => 4,
+                        pulldown_cmark::HeadingLevel::H5 => 5,
+                        pulldown_cmark::HeadingLevel::H6 => 6,
+                    };
+                    in_heading = true;
+                }
+                Event::End(TagEnd::Heading(_)) => {
+                    in_heading = false;
+                    let trimmed = heading_text.trim();
+                    if !trimmed.is_empty() {
+                        builder.push_heading(heading_level, trimmed, None, None);
+                    }
+                    heading_text.clear();
+                }
+                Event::Start(Tag::Paragraph) => {
+                    if !in_heading && !in_list_item {
+                        paragraph_text.clear();
+                        paragraph_annotations.clear();
+                        in_paragraph = true;
+                    }
+                }
+                Event::End(TagEnd::Paragraph) => {
+                    if in_paragraph {
+                        in_paragraph = false;
+                        let trimmed = paragraph_text.trim();
+                        if !trimmed.is_empty() {
+                            // Adjust annotations for leading whitespace trim
+                            let trim_offset = paragraph_text.len() - paragraph_text.trim_start().len();
+                            let trimmed_len = trimmed.len() as u32;
+                            let annotations = if trim_offset > 0 {
+                                paragraph_annotations
+                                    .drain(..)
+                                    .map(|mut a| {
+                                        a.start = a.start.saturating_sub(trim_offset as u32);
+                                        a.end = a.end.saturating_sub(trim_offset as u32);
+                                        a
+                                    })
+                                    .filter(|a| a.start < a.end && a.end <= trimmed_len)
+                                    .collect()
+                            } else {
+                                paragraph_annotations
+                                    .drain(..)
+                                    .filter(|a| a.start < a.end && a.end <= trimmed_len)
+                                    .collect()
+                            };
+                            builder.push_paragraph(trimmed, annotations, None, None);
+                        }
+                        paragraph_text.clear();
+                        paragraph_annotations.clear();
+                    }
+                }
+                // Inline formatting — annotation tracking
+                Event::Start(Tag::Strong) => {
+                    if in_paragraph {
+                        annotation_starts.push((0, text_offset(&paragraph_text, in_paragraph), None));
+                    }
+                }
+                Event::End(TagEnd::Strong) => {
+                    if in_paragraph
+                        && let Some((0, start, _)) = annotation_starts
+                            .iter()
+                            .rposition(|(k, _, _)| *k == 0)
+                            .map(|i| annotation_starts.remove(i))
+                    {
+                        let end = text_offset(&paragraph_text, in_paragraph);
+                        if start < end {
+                            paragraph_annotations.push(builder::bold(start, end));
+                        }
+                    }
+                }
+                Event::Start(Tag::Emphasis) => {
+                    if in_paragraph {
+                        annotation_starts.push((1, text_offset(&paragraph_text, in_paragraph), None));
+                    }
+                }
+                Event::End(TagEnd::Emphasis) => {
+                    if in_paragraph
+                        && let Some((1, start, _)) = annotation_starts
+                            .iter()
+                            .rposition(|(k, _, _)| *k == 1)
+                            .map(|i| annotation_starts.remove(i))
+                    {
+                        let end = text_offset(&paragraph_text, in_paragraph);
+                        if start < end {
+                            paragraph_annotations.push(builder::italic(start, end));
+                        }
+                    }
+                }
+                Event::Start(Tag::Strikethrough) => {
+                    if in_paragraph {
+                        annotation_starts.push((2, text_offset(&paragraph_text, in_paragraph), None));
+                    }
+                }
+                Event::End(TagEnd::Strikethrough) => {
+                    if in_paragraph
+                        && let Some((2, start, _)) = annotation_starts
+                            .iter()
+                            .rposition(|(k, _, _)| *k == 2)
+                            .map(|i| annotation_starts.remove(i))
+                    {
+                        let end = text_offset(&paragraph_text, in_paragraph);
+                        if start < end {
+                            paragraph_annotations.push(builder::strikethrough(start, end));
+                        }
+                    }
+                }
+                Event::Start(Tag::Link { dest_url, title, .. }) => {
+                    if in_paragraph {
+                        let url = dest_url.to_string();
+                        let title_opt = if title.is_empty() {
+                            None
+                        } else {
+                            Some(title.to_string())
+                        };
+                        annotation_starts.push((4, text_offset(&paragraph_text, in_paragraph), Some((url, title_opt))));
+                    }
+                }
+                Event::End(TagEnd::Link) => {
+                    if in_paragraph
+                        && let Some((4, start, Some((url, title)))) = annotation_starts
+                            .iter()
+                            .rposition(|(k, _, _)| *k == 4)
+                            .map(|i| annotation_starts.remove(i))
+                    {
+                        let end = text_offset(&paragraph_text, in_paragraph);
+                        if start < end {
+                            paragraph_annotations.push(builder::link(start, end, &url, title.as_deref()));
+                        }
+                    }
+                }
+                Event::Start(Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(lang))) => {
+                    code_text.clear();
+                    code_lang = if lang.is_empty() { None } else { Some(lang.to_string()) };
+                    in_code_block = true;
+                }
+                Event::Start(Tag::CodeBlock(_)) => {
+                    code_text.clear();
+                    code_lang = None;
+                    in_code_block = true;
+                }
+                Event::End(TagEnd::CodeBlock) => {
+                    in_code_block = false;
+                    let trimmed = code_text.trim_end();
+                    if !trimmed.is_empty() {
+                        builder.push_code(trimmed, code_lang.as_deref(), None);
+                    }
+                    code_text.clear();
+                    code_lang = None;
+                }
+                Event::Start(Tag::BlockQuote(_)) => {
+                    builder.push_quote(None);
+                    blockquote_depth += 1;
+                }
+                Event::End(TagEnd::BlockQuote(_)) => {
+                    if blockquote_depth > 0 {
+                        builder.exit_container();
+                        blockquote_depth -= 1;
+                    }
+                }
+                Event::Start(Tag::List(start)) => {
+                    let ordered = start.is_some();
+                    let list_idx = builder.push_list(ordered, None);
+                    list_stack.push((list_idx, ordered));
+                }
+                Event::End(TagEnd::List(_)) => {
+                    list_stack.pop();
+                }
+                Event::Start(Tag::Item) => {
+                    list_item_text.clear();
+                    in_list_item = true;
+                }
+                Event::End(TagEnd::Item) => {
+                    in_list_item = false;
+                    let trimmed = list_item_text.trim();
+                    if let Some((list_idx, _)) = list_stack.last()
+                        && !trimmed.is_empty()
+                    {
+                        builder.push_list_item(*list_idx, trimmed, None);
+                    }
+                    list_item_text.clear();
+                }
+                Event::Start(Tag::Table(_)) => {
+                    table_rows.clear();
+                }
+                Event::End(TagEnd::Table) => {
+                    if !table_rows.is_empty() {
+                        builder.push_table_from_cells(&table_rows, None);
+                    }
+                    table_rows.clear();
+                }
+                Event::Start(Tag::TableHead | Tag::TableRow) => {
+                    current_row.clear();
+                }
+                Event::End(TagEnd::TableHead | TagEnd::TableRow) => {
+                    if !current_row.is_empty() {
+                        table_rows.push(std::mem::take(&mut current_row));
+                    }
+                }
+                Event::Start(Tag::TableCell) => {
+                    current_cell.clear();
+                    in_table_cell = true;
+                }
+                Event::End(TagEnd::TableCell) => {
+                    in_table_cell = false;
+                    current_row.push(current_cell.trim().to_string());
+                    current_cell.clear();
+                }
+                Event::Start(Tag::Image { .. }) => {
+                    in_image = true;
+                    image_alt.clear();
+                }
+                Event::End(TagEnd::Image) => {
+                    in_image = false;
+                    let trimmed = image_alt.trim();
+                    let desc = if trimmed.is_empty() { None } else { Some(trimmed) };
+                    builder.push_image(desc, None, None, None);
+                    image_alt.clear();
+                }
+                Event::Code(s) => {
+                    if in_code_block {
+                        code_text.push_str(s);
+                    } else if in_heading {
+                        heading_text.push_str(s);
+                    } else if in_image {
+                        image_alt.push_str(s);
+                    } else if in_table_cell {
+                        current_cell.push_str(s);
+                    } else if in_list_item {
+                        list_item_text.push_str(s);
+                    } else if in_paragraph {
+                        // Inline code: record annotation
+                        let start = paragraph_text.len() as u32;
+                        paragraph_text.push_str(s);
+                        let end = paragraph_text.len() as u32;
+                        if start < end {
+                            paragraph_annotations.push(builder::code(start, end));
+                        }
+                    }
+                }
+                Event::Text(s) => {
+                    if in_code_block {
+                        code_text.push_str(s);
+                    } else if in_heading {
+                        heading_text.push_str(s);
+                    } else if in_image {
+                        image_alt.push_str(s);
+                    } else if in_table_cell {
+                        current_cell.push_str(s);
+                    } else if in_list_item {
+                        list_item_text.push_str(s);
+                    } else if in_paragraph {
+                        paragraph_text.push_str(s);
+                    }
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    if in_code_block {
+                        code_text.push('\n');
+                    } else if in_heading {
+                        heading_text.push(' ');
+                    } else if in_list_item {
+                        list_item_text.push(' ');
+                    } else if in_paragraph {
+                        paragraph_text.push(' ');
+                    }
+                }
+                Event::FootnoteReference(name) => {
+                    builder.push_footnote(name, None);
+                }
+                Event::Html(s) => {
+                    if in_paragraph {
+                        paragraph_text.push_str(s);
+                    }
+                }
+                Event::TaskListMarker(checked) => {
+                    if in_list_item {
+                        list_item_text.push_str(if *checked { "[x] " } else { "[ ] " });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl Default for MarkdownExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Plugin for MarkdownExtractor {
+    fn name(&self) -> &str {
+        "markdown-extractor"
+    }
+
+    fn version(&self) -> String {
+        env!("CARGO_PKG_VERSION").to_string()
+    }
+
+    fn initialize(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn description(&self) -> &str {
+        "Extracts content from Markdown files with YAML frontmatter and table support"
+    }
+
+    fn author(&self) -> &str {
+        "Kreuzberg Team"
+    }
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+impl DocumentExtractor for MarkdownExtractor {
+    async fn extract_bytes(
+        &self,
+        content: &[u8],
+        mime_type: &str,
+        config: &ExtractionConfig,
+    ) -> Result<ExtractionResult> {
+        let text = String::from_utf8_lossy(content).into_owned();
+
+        let (yaml, remaining_content) = extract_frontmatter(&text);
+
+        let mut metadata = if let Some(ref yaml_value) = yaml {
+            extract_metadata_from_yaml(yaml_value)
+        } else {
+            Metadata::default()
+        };
+
+        if metadata.title.is_none()
+            && !metadata.additional.contains_key("title")
+            && let Some(title) = extract_title_from_content(&remaining_content)
+        {
+            metadata.title = Some(title.clone());
+            // DEPRECATED: kept for backward compatibility; will be removed in next major version.
+            metadata.additional.insert(Cow::Borrowed("title"), title.into());
+        }
+
+        let mut options = Options::ENABLE_TABLES;
+        if config.include_document_structure {
+            options |= Options::ENABLE_STRIKETHROUGH | Options::ENABLE_FOOTNOTES;
+        }
+        let parser = Parser::new_ext(&remaining_content, options);
+        let events: Vec<Event> = parser.collect();
+
+        let mut extracted_images = Vec::new();
+        // Walk the AST only for images (data URI extraction); use raw text for content
+        let _ = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut extracted_images);
+
+        let tables = Self::extract_tables_from_events(&events);
+
+        let document = if config.include_document_structure {
+            Some(Self::build_document_structure(&events, &yaml))
+        } else {
+            None
+        };
+
+        let images = if !extracted_images.is_empty() {
+            #[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+            {
+                let processed = crate::extraction::image_ocr::process_images_with_ocr(extracted_images, config).await?;
+                Some(processed)
+            }
+            #[cfg(not(all(feature = "ocr", feature = "tokio-runtime")))]
+            {
+                Some(extracted_images)
+            }
+        } else {
+            None
+        };
+
+        Ok(ExtractionResult {
+            content: remaining_content.to_string(),
+            mime_type: mime_type.to_string().into(),
+            metadata,
+            tables,
+            detected_languages: None,
+            chunks: None,
+            images,
+            djot_content: None,
+            pages: None,
+            elements: None,
+            ocr_elements: None,
+            document,
+            #[cfg(any(feature = "keywords-yake", feature = "keywords-rake"))]
+            extracted_keywords: None,
+            quality_score: None,
+            processing_warnings: Vec::new(),
+            annotations: None,
+            children: None,
+        })
+    }
+
+    fn supported_mime_types(&self) -> &[&str] {
+        &[
+            "text/markdown",
+            "text/x-markdown",
+            "text/x-gfm",
+            "text/x-commonmark",
+            "text/x-markdown-extra",
+            "text/x-multimarkdown",
+        ]
+    }
+
+    fn priority(&self) -> i32 {
+        50
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::frontmatter_utils::{cells_to_markdown, extract_frontmatter, extract_metadata_from_yaml};
+    use super::*;
+    use serde_yaml_ng::Value as YamlValue;
+
+    #[test]
+    fn test_can_extract_markdown_mime_types() {
+        let extractor = MarkdownExtractor::new();
+        let mime_types = extractor.supported_mime_types();
+
+        assert!(mime_types.contains(&"text/markdown"));
+        assert!(mime_types.contains(&"text/x-markdown"));
+        assert!(mime_types.contains(&"text/x-gfm"));
+        assert!(mime_types.contains(&"text/x-commonmark"));
+        assert!(mime_types.contains(&"text/x-markdown-extra"));
+        assert!(mime_types.contains(&"text/x-multimarkdown"));
+    }
+
+    #[test]
+    fn test_extract_simple_markdown() {
+        let content =
+            b"# Header\n\nThis is a paragraph with **bold** and *italic* text.\n\n## Subheading\n\nMore content here.";
+        let text = String::from_utf8_lossy(content).into_owned();
+
+        let (yaml, remaining) = extract_frontmatter(&text);
+        assert!(yaml.is_none());
+        assert!(!remaining.is_empty());
+
+        let parser = Parser::new_ext(&remaining, Options::ENABLE_TABLES);
+        let events: Vec<Event> = parser.collect();
+        let extracted = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut Vec::new());
+
+        assert!(extracted.contains("Header"));
+        assert!(extracted.contains("This is a paragraph"));
+        assert!(extracted.contains("bold"));
+        assert!(extracted.contains("italic"));
+    }
+
+    #[test]
+    fn test_extract_frontmatter_metadata() {
+        let content = b"---\ntitle: My Document\nauthor: John Doe\ndate: 2024-01-15\nkeywords: rust, markdown, extraction\ndescription: A test document\n---\n\n# Content\n\nBody text.";
+
+        let text = String::from_utf8_lossy(content).into_owned();
+
+        let (yaml_opt, remaining) = extract_frontmatter(&text);
+        assert!(yaml_opt.is_some());
+        assert!(remaining.contains("# Content"));
+
+        let yaml = yaml_opt.expect("Should extract YAML frontmatter");
+        let metadata = extract_metadata_from_yaml(&yaml);
+
+        assert_eq!(
+            metadata
+                .additional
+                .get("title")
+                .and_then(|v: &serde_json::Value| v.as_str()),
+            Some("My Document")
+        );
+        assert_eq!(
+            metadata
+                .additional
+                .get("author")
+                .and_then(|v: &serde_json::Value| v.as_str()),
+            Some("John Doe")
+        );
+        assert_eq!(metadata.created_at, Some("2024-01-15".to_string()));
+        assert!(metadata.subject.is_some());
+        assert!(
+            metadata
+                .subject
+                .as_ref()
+                .expect("Should have subject description")
+                .contains("test document")
+        );
+    }
+
+    #[test]
+    fn test_extract_frontmatter_metadata_array_keywords() {
+        let content = b"---\ntitle: Document\nkeywords:\n  - rust\n  - markdown\n  - parsing\n---\n\nContent";
+
+        let text = String::from_utf8_lossy(content).into_owned();
+        let (yaml_opt, _remaining) = extract_frontmatter(&text);
+
+        assert!(yaml_opt.is_some());
+        let yaml = yaml_opt.expect("Should extract YAML frontmatter");
+        let metadata = extract_metadata_from_yaml(&yaml);
+
+        let keywords = metadata
+            .additional
+            .get("keywords")
+            .and_then(|v: &serde_json::Value| v.as_str());
+        assert!(keywords.is_some());
+        let keywords_str = keywords.expect("Should extract keywords from metadata");
+        assert!(keywords_str.contains("rust"));
+        assert!(keywords_str.contains("markdown"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_tables() {
+        let content = b"# Tables Example\n\n| Header 1 | Header 2 |\n|----------|----------|\n| Cell 1   | Cell 2   |\n| Cell 3   | Cell 4   |";
+
+        let extractor = MarkdownExtractor::new();
+        let result = extractor
+            .extract_bytes(content, "text/markdown", &ExtractionConfig::default())
+            .await
+            .expect("Should extract markdown with tables");
+
+        assert!(!result.tables.is_empty());
+        let table = &result.tables[0];
+        assert!(!table.cells.is_empty());
+        assert_eq!(table.cells[0].len(), 2);
+        assert!(!table.markdown.is_empty());
+    }
+
+    #[test]
+    fn test_extract_without_frontmatter() {
+        let content = b"# Main Title\n\nSome content\n\nMore text";
+        let text = String::from_utf8_lossy(content).into_owned();
+
+        let (yaml, remaining) = extract_frontmatter(&text);
+        assert!(yaml.is_none());
+        assert_eq!(remaining, text);
+
+        let title = extract_title_from_content(&remaining);
+        assert_eq!(title, Some("Main Title".to_string()));
+    }
+
+    #[test]
+    fn test_empty_document() {
+        let content = b"";
+        let text = String::from_utf8_lossy(content).into_owned();
+
+        let (yaml, remaining) = extract_frontmatter(&text);
+        assert!(yaml.is_none());
+        assert!(remaining.is_empty());
+
+        let parser = Parser::new_ext(&remaining, Options::ENABLE_TABLES);
+        let events: Vec<Event> = parser.collect();
+        let extracted = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut Vec::new());
+        assert!(extracted.is_empty());
+    }
+
+    #[test]
+    fn test_whitespace_only_document() {
+        let content = b"   \n\n  \n";
+        let text = String::from_utf8_lossy(content).into_owned();
+
+        let (yaml, remaining) = extract_frontmatter(&text);
+        assert!(yaml.is_none());
+
+        let parser = Parser::new_ext(&remaining, Options::ENABLE_TABLES);
+        let events: Vec<Event> = parser.collect();
+        let extracted = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut Vec::new());
+        assert!(extracted.trim().is_empty());
+    }
+
+    #[test]
+    fn test_unicode_content() {
+        let content = "# 日本語のタイトル\n\nこれは日本語の内容です。\n\n## Español\n\nEste es un documento en español.\n\n## Русский\n\nЭто русский текст.".as_bytes();
+
+        let text = String::from_utf8_lossy(content).into_owned();
+
+        let (yaml, remaining) = extract_frontmatter(&text);
+        assert!(yaml.is_none());
+
+        let parser = Parser::new_ext(&remaining, Options::ENABLE_TABLES);
+        let events: Vec<Event> = parser.collect();
+        let extracted = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut Vec::new());
+
+        assert!(extracted.contains("日本語"));
+        assert!(extracted.contains("Español"));
+        assert!(extracted.contains("Русский"));
+    }
+
+    #[tokio::test]
+    async fn test_full_extraction_with_frontmatter_and_tables() {
+        let content = b"---\ntitle: Complete Document\nauthor: Test Author\ndate: 2024-01-20\n---\n\n# Document\n\nIntroduction text.\n\n| Name | Value |\n|------|-------|\n| A    | 1     |\n| B    | 2     |";
+
+        let extractor = MarkdownExtractor::new();
+        let result = extractor
+            .extract_bytes(content, "text/x-markdown", &ExtractionConfig::default())
+            .await
+            .expect("Should extract markdown with frontmatter and tables");
+
+        assert_eq!(result.mime_type, "text/x-markdown");
+        assert!(result.content.contains("Introduction text"));
+        assert_eq!(
+            result.metadata.additional.get("title").and_then(|v| v.as_str()),
+            Some("Complete Document")
+        );
+        assert_eq!(
+            result.metadata.additional.get("author").and_then(|v| v.as_str()),
+            Some("Test Author")
+        );
+        assert!(!result.tables.is_empty());
+    }
+
+    #[test]
+    fn test_plugin_interface() {
+        let extractor = MarkdownExtractor::new();
+        assert_eq!(extractor.name(), "markdown-extractor");
+        assert_eq!(extractor.version(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(extractor.priority(), 50);
+        assert!(extractor.supported_mime_types().contains(&"text/markdown"));
+    }
+
+    #[test]
+    fn test_cells_to_markdown() {
+        let cells = vec![
+            vec!["Header 1".to_string(), "Header 2".to_string()],
+            vec!["Data 1".to_string(), "Data 2".to_string()],
+            vec!["Data 3".to_string(), "Data 4".to_string()],
+        ];
+
+        let markdown = cells_to_markdown(&cells);
+        assert!(markdown.contains("Header 1"));
+        assert!(markdown.contains("Data 1"));
+        assert!(markdown.contains("---"));
+        let lines: Vec<&str> = markdown.lines().collect();
+        assert!(lines.len() >= 4);
+    }
+
+    #[test]
+    fn test_extract_markdown_with_links() {
+        let content = b"# Page\n\nCheck [Google](https://google.com) and [Rust](https://rust-lang.org).";
+        let text = String::from_utf8_lossy(content).into_owned();
+
+        let parser = Parser::new_ext(&text, Options::ENABLE_TABLES);
+        let events: Vec<Event> = parser.collect();
+        let extracted = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut Vec::new());
+
+        assert!(extracted.contains("Google"));
+        assert!(extracted.contains("Rust"));
+    }
+
+    #[test]
+    fn test_extract_markdown_with_code_blocks() {
+        let content = b"# Code Example\n\n```rust\nfn main() {\n    println!(\"Hello\");\n}\n```";
+        let text = String::from_utf8_lossy(content).into_owned();
+
+        let parser = Parser::new_ext(&text, Options::ENABLE_TABLES);
+        let events: Vec<Event> = parser.collect();
+        let extracted = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut Vec::new());
+
+        assert!(extracted.contains("main"));
+        assert!(extracted.contains("println"));
+    }
+
+    #[test]
+    fn test_malformed_frontmatter_fallback() {
+        let content = b"---\nthis: is: invalid: yaml:\n---\n\nContent here";
+        let text = String::from_utf8_lossy(content).into_owned();
+
+        let (yaml, _remaining) = extract_frontmatter(&text);
+        let _ = yaml;
+    }
+
+    #[test]
+    fn test_metadata_extraction_completeness() {
+        let yaml_str = r#"
+title: "Test Document"
+author: "Test Author"
+date: "2024-01-15"
+keywords:
+  - rust
+  - markdown
+  - testing
+description: "A test description"
+abstract: "Test abstract"
+subject: "Test subject"
+category: "Documentation"
+version: "1.2.3"
+language: "en"
+tags:
+  - tag1
+  - tag2
+custom_field: "custom_value"
+nested:
+  organization: "Test Corp"
+  contact:
+    email: "test@example.com"
+"#;
+
+        let yaml: YamlValue = serde_yaml_ng::from_str(yaml_str).expect("Valid YAML");
+        let metadata = extract_metadata_from_yaml(&yaml);
+
+        assert_eq!(metadata.created_at, Some("2024-01-15".to_string()));
+        assert_eq!(
+            metadata.additional.get("title").and_then(|v| v.as_str()),
+            Some("Test Document")
+        );
+        assert_eq!(
+            metadata.additional.get("author").and_then(|v| v.as_str()),
+            Some("Test Author")
+        );
+
+        assert!(metadata.additional.contains_key("keywords"));
+        let keywords = metadata
+            .additional
+            .get("keywords")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(keywords.contains("rust"));
+        assert!(keywords.contains("markdown"));
+
+        assert_eq!(metadata.subject, Some("Test subject".to_string()));
+
+        assert_eq!(
+            metadata.additional.get("abstract").and_then(|v| v.as_str()),
+            Some("Test abstract")
+        );
+
+        assert_eq!(
+            metadata.additional.get("category").and_then(|v| v.as_str()),
+            Some("Documentation")
+        );
+
+        assert!(metadata.additional.contains_key("tags"));
+        let tags = metadata.additional.get("tags").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(tags.contains("tag1"));
+        assert!(tags.contains("tag2"));
+
+        assert_eq!(metadata.additional.get("language").and_then(|v| v.as_str()), Some("en"));
+
+        assert_eq!(
+            metadata.additional.get("version").and_then(|v| v.as_str()),
+            Some("1.2.3")
+        );
+
+        assert_eq!(metadata.additional.len(), 8, "Should extract all standard fields");
+        println!("\nSuccessfully extracted all 8 additional metadata fields");
+    }
+
+    #[test]
+    fn test_decode_data_uri_png() {
+        // 1x1 red PNG pixel (minimal valid PNG)
+        let png_b64 =
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+        let uri = format!("data:image/png;base64,{png_b64}");
+
+        let image = crate::extractors::markdown_utils::decode_data_uri_image(&uri, 0);
+        assert!(image.is_some());
+        let img = image.unwrap();
+        assert_eq!(img.format.as_ref(), "png");
+        assert_eq!(img.image_index, 0);
+        assert!(!img.data.is_empty());
+    }
+
+    #[test]
+    fn test_decode_data_uri_jpeg() {
+        // Minimal JPEG-like base64 (tests the decode path)
+        let uri = "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+
+        let image = crate::extractors::markdown_utils::decode_data_uri_image(uri, 3);
+        assert!(image.is_some());
+        let img = image.unwrap();
+        assert_eq!(img.format.as_ref(), "jpeg");
+        assert_eq!(img.image_index, 3);
+    }
+
+    #[test]
+    fn test_decode_data_uri_unsupported_format() {
+        let uri = "data:image/tiff;base64,AAAA";
+        let image = crate::extractors::markdown_utils::decode_data_uri_image(uri, 0);
+        assert!(image.is_none());
+    }
+
+    #[test]
+    fn test_decode_data_uri_non_base64() {
+        let uri = "data:image/png,raw-data-here";
+        let image = crate::extractors::markdown_utils::decode_data_uri_image(uri, 0);
+        assert!(image.is_none());
+    }
+
+    #[test]
+    fn test_decode_data_uri_invalid_base64() {
+        let uri = "data:image/png;base64,!!!not-valid-base64!!!";
+        let image = crate::extractors::markdown_utils::decode_data_uri_image(uri, 0);
+        assert!(image.is_none());
+    }
+
+    #[test]
+    fn test_decode_data_uri_not_data_uri() {
+        let uri = "https://example.com/image.png";
+        let image = crate::extractors::markdown_utils::decode_data_uri_image(uri, 0);
+        assert!(image.is_none());
+    }
+
+    #[test]
+    fn test_extract_text_collects_data_uri_images() {
+        let png_b64 =
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+        let md = format!("# Title\n\n![alt](data:image/png;base64,{png_b64})\n\nSome text.");
+
+        let parser = Parser::new_ext(&md, Options::ENABLE_TABLES);
+        let events: Vec<Event> = parser.collect();
+        let mut images = Vec::new();
+        let text = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut images);
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format.as_ref(), "png");
+        assert!(text.contains("[Image: data:image/png;base64,"));
+    }
+
+    #[test]
+    fn test_extract_text_skips_http_images() {
+        let md = "# Title\n\n![alt](https://example.com/photo.jpg)\n\nSome text.";
+
+        let parser = Parser::new_ext(md, Options::ENABLE_TABLES);
+        let events: Vec<Event> = parser.collect();
+        let mut images = Vec::new();
+        let text = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut images);
+
+        assert!(images.is_empty());
+        assert!(text.contains("[Image: https://example.com/photo.jpg]"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_bytes_with_data_uri_image() {
+        let png_b64 =
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+        let md = format!("# Doc\n\n![photo](data:image/png;base64,{png_b64})\n\nText.");
+
+        let extractor = MarkdownExtractor::new();
+        let result = extractor
+            .extract_bytes(md.as_bytes(), "text/markdown", &ExtractionConfig::default())
+            .await
+            .expect("Should extract markdown with data URI image");
+
+        assert!(result.images.is_some());
+        let imgs = result.images.unwrap();
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].format.as_ref(), "png");
+    }
+
+    #[tokio::test]
+    async fn test_extract_bytes_no_images() {
+        let md = b"# Simple\n\nJust text, no images.";
+
+        let extractor = MarkdownExtractor::new();
+        let result = extractor
+            .extract_bytes(md, "text/markdown", &ExtractionConfig::default())
+            .await
+            .expect("Should extract markdown without images");
+
+        assert!(result.images.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_trimmed_paragraph_with_emoji() {
+        // Trimming paragraph text with multi-byte emoji must not produce
+        // annotations pointing past the trimmed text end.
+        let md = b"  **bold** \xf0\x9f\x8e\x89 text  ";
+
+        let extractor = MarkdownExtractor::new();
+        let result = extractor
+            .extract_bytes(md, "text/markdown", &ExtractionConfig::default())
+            .await
+            .expect("Should handle emoji in trimmed paragraph");
+
+        assert!(result.content.contains("bold"), "Bold text preserved");
+        assert!(result.content.contains("\u{1F389}"), "Emoji preserved after trim");
+    }
+
+    #[tokio::test]
+    async fn test_cjk_paragraph_with_formatting() {
+        let md = "# CJK\n\nこれは**太字**テスト".as_bytes();
+
+        let extractor = MarkdownExtractor::new();
+        let result = extractor
+            .extract_bytes(md, "text/markdown", &ExtractionConfig::default())
+            .await
+            .expect("Should handle CJK with bold formatting");
+
+        assert!(result.content.contains("太字"), "Bold CJK content present");
+        assert!(result.content.contains("これは"), "Leading CJK preserved");
+    }
+}
